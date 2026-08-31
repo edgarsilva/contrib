@@ -1,137 +1,168 @@
+// Package monitor provides real-time operational metrics for Fiber services.
 package monitor
 
 import (
-	"os"
-	"runtime"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/load"
-	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/net"
-	"github.com/shirou/gopsutil/v4/process"
 )
 
-type stats struct {
-	PID statsPID `json:"pid"`
-	OS  statsOS  `json:"os"`
-}
-
-type statsPID struct {
-	CPU   float64 `json:"cpu"`
-	RAM   uint64  `json:"ram"`
-	Conns int     `json:"conns"`
-}
-
-type statsOS struct {
-	CPU      float64 `json:"cpu"`
-	RAM      uint64  `json:"ram"`
-	TotalRAM uint64  `json:"total_ram"`
-	LoadAvg  float64 `json:"load_avg"`
-	Conns    int     `json:"conns"`
-}
-
-var (
-	monitPIDCPU   atomic.Value
-	monitPIDRAM   atomic.Value
-	monitPIDConns atomic.Value
-
-	monitOSCPU      atomic.Value
-	monitOSRAM      atomic.Value
-	monitOSTotalRAM atomic.Value
-	monitOSLoadAvg  atomic.Value
-	monitOSConns    atomic.Value
+const (
+	headerCacheControl        = "Cache-Control"
+	headerXContentTypeOptions = "X-Content-Type-Options"
+	headerAllow               = "Allow"
 )
 
-var (
-	mutex sync.RWMutex
-	once  sync.Once
-	data  = &stats{}
-)
+// middleware keeps the business-request path limited to time reads and
+// atomics. collectMu protects the mutable collector baselines and histogram
+// reset only while a fresh dashboard snapshot is being built; business
+// requests never acquire it.
+type middleware struct {
+	next    func(fiber.Ctx) bool
+	apiOnly bool
+	refresh time.Duration
+	index   string
 
-// New creates a new middleware handler
+	requests atomic.Uint64
+	inFlight atomic.Uint64
+	status1  atomic.Uint64
+	status2  atomic.Uint64
+	status3  atomic.Uint64
+	status4  atomic.Uint64
+	status5  atomic.Uint64
+	latency  latencyHistogram
+
+	collectMu sync.Mutex
+	cache     atomic.Pointer[cacheEntry]
+	collector collector
+	collectFn func(time.Time) snapshot
+	now       func() time.Time
+}
+
+// New creates a Fiber handler that serves the dashboard and JSON snapshot on
+// whichever route it is mounted. When Config.Next returns true, the request is
+// passed downstream and included in the aggregate HTTP metrics instead.
 func New(config ...Config) fiber.Handler {
-	// Set default config
-	cfg := configDefault(config...)
+	m, err := newMiddleware(config...)
+	if err != nil {
+		panic(fmt.Errorf("fiber: monitor middleware error -> %w", err))
+	}
+	return m.handler()
+}
 
-	// Start routine to update statistics
-	once.Do(func() {
-		p, _ := process.NewProcess(int32(os.Getpid())) //nolint:errcheck // TODO: Handle error
-		numcpu := runtime.NumCPU()
-		updateStatistics(p, numcpu)
+func newMiddleware(config ...Config) (*middleware, error) {
+	cfg, err := configDefault(config...).normalized()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	index, err := renderDashboard(cfg)
+	if err != nil {
+		return nil, err
+	}
+	m := &middleware{
+		next:      cfg.Next,
+		apiOnly:   cfg.APIOnly,
+		refresh:   cfg.Refresh,
+		index:     index,
+		collector: newCollector(now, cfg.EnableGCPauseMetrics),
+		now:       time.Now,
+	}
+	m.collectFn = m.collectSnapshot
+	return m, nil
+}
 
-		go func() {
-			for {
-				time.Sleep(cfg.Refresh)
-
-				updateStatistics(p, numcpu)
-			}
-		}()
-	})
-
-	// Return new handler
-	//nolint:errcheck // Ignore the type-assertion errors
+func (m *middleware) handler() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		// Don't execute middleware if Next returns true
-		if cfg.Next != nil && cfg.Next(c) {
-			return c.Next()
+		// This preserves monitor's route-agnostic mounting contract. A false
+		// Next result identifies the monitor endpoint; a true result passes the
+		// request through and records it as application traffic.
+		if m.next != nil && m.next(c) {
+			return m.instrument(c)
 		}
-
-		if c.Method() != fiber.MethodGet {
-			return fiber.ErrMethodNotAllowed
-		}
-		if c.Get(fiber.HeaderAccept) == fiber.MIMEApplicationJSON || cfg.APIOnly {
-			mutex.Lock()
-			data.PID.CPU, _ = monitPIDCPU.Load().(float64)
-			data.PID.RAM, _ = monitPIDRAM.Load().(uint64)
-			data.PID.Conns, _ = monitPIDConns.Load().(int)
-
-			data.OS.CPU, _ = monitOSCPU.Load().(float64)
-			data.OS.RAM, _ = monitOSRAM.Load().(uint64)
-			data.OS.TotalRAM, _ = monitOSTotalRAM.Load().(uint64)
-			data.OS.LoadAvg, _ = monitOSLoadAvg.Load().(float64)
-			data.OS.Conns, _ = monitOSConns.Load().(int)
-			mutex.Unlock()
-			return c.Status(fiber.StatusOK).JSON(data)
-		}
-		c.Set(fiber.HeaderContentType, fiber.MIMETextHTMLCharsetUTF8)
-		return c.Status(fiber.StatusOK).SendString(cfg.index)
+		return m.serveMonitor(c)
 	}
 }
 
-func updateStatistics(p *process.Process, numcpu int) {
-	pidCPU, err := p.Percent(0)
-	if err == nil {
-		monitPIDCPU.Store(pidCPU / float64(numcpu))
+// instrument records the response that Fiber ultimately sends. Fiber normally
+// runs the application ErrorHandler only after the whole handler chain returns,
+// so invoking it here is necessary to observe custom client-visible statuses.
+func (m *middleware) instrument(c fiber.Ctx) error {
+	started := time.Now()
+	sequence := m.requests.Add(1)
+	m.inFlight.Add(1)
+	// Keep in-flight balanced when downstream panics. Panic recovery remains the
+	// application's responsibility and should be mounted after monitor.
+	defer m.inFlight.Add(^uint64(0))
+
+	err := c.Next()
+	if err != nil {
+		if handlerErr := c.App().ErrorHandler(c, err); handlerErr != nil {
+			_ = c.SendStatus(fiber.StatusInternalServerError) //nolint:errcheck // mirrors Fiber's fallback
+		}
 	}
 
-	if osCPU, err := cpu.Percent(0, false); err == nil && len(osCPU) > 0 {
-		monitOSCPU.Store(osCPU[0])
+	// Fiber's timeout middleware parks its response separately because the timed
+	// out handler can still own the live response buffer. Read that response when
+	// present so a client-visible 408 is not classified as a 200.
+	response := c.Response()
+	if timedOut := c.RequestCtx().LastTimeoutErrorResponse(); timedOut != nil {
+		response = timedOut
 	}
+	m.recordStatus(response.StatusCode())
 
-	if pidRAM, err := p.MemoryInfo(); err == nil && pidRAM != nil {
-		monitPIDRAM.Store(pidRAM.RSS)
+	elapsed := time.Since(started)
+	if elapsed < 0 {
+		elapsed = 0
 	}
+	m.latency.observeSharded(uint64(elapsed.Nanoseconds()), sequence)
+	return nil
+}
 
-	if osRAM, err := mem.VirtualMemory(); err == nil && osRAM != nil {
-		monitOSRAM.Store(osRAM.Used)
-		monitOSTotalRAM.Store(osRAM.Total)
+func (m *middleware) serveMonitor(c fiber.Ctx) error {
+	method := c.Method()
+	if method != fiber.MethodGet && method != fiber.MethodHead {
+		c.Set(headerAllow, "GET, HEAD")
+		return fiber.ErrMethodNotAllowed
 	}
-
-	if loadAvg, err := load.Avg(); err == nil && loadAvg != nil {
-		monitOSLoadAvg.Store(loadAvg.Load1)
+	if m.apiOnly || c.Accepts(fiber.MIMETextHTML, fiber.MIMEApplicationJSON) == fiber.MIMEApplicationJSON {
+		return m.serveJSON(c)
 	}
+	return m.serveHTML(c)
+}
 
-	pidConns, err := net.ConnectionsPid("tcp", p.Pid)
-	if err == nil {
-		monitPIDConns.Store(len(pidConns))
-	}
+func (m *middleware) serveHTML(c fiber.Ctx) error {
+	setDashboardHeaders(c)
+	c.Set(fiber.HeaderContentType, fiber.MIMETextHTMLCharsetUTF8)
+	return c.Status(fiber.StatusOK).SendString(m.index)
+}
 
-	osConns, err := net.Connections("tcp")
-	if err == nil {
-		monitOSConns.Store(len(osConns))
+func (m *middleware) serveJSON(c fiber.Ctx) error {
+	setDashboardHeaders(c)
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSONCharsetUTF8)
+	current := m.currentSnapshot(m.now())
+	return c.Status(fiber.StatusOK).JSON(&current)
+}
+
+func setDashboardHeaders(c fiber.Ctx) {
+	c.Set(headerCacheControl, "no-store")
+	c.Set(headerXContentTypeOptions, "nosniff")
+}
+
+func (m *middleware) recordStatus(status int) {
+	switch status / 100 {
+	case 1:
+		m.status1.Add(1)
+	case 2:
+		m.status2.Add(1)
+	case 3:
+		m.status3.Add(1)
+	case 4:
+		m.status4.Add(1)
+	case 5:
+		m.status5.Add(1)
 	}
 }

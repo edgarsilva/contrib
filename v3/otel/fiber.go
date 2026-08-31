@@ -1,11 +1,12 @@
 package otel
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
-	"sync"
-	"sync/atomic"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/contrib/v3/otel/internal"
@@ -15,12 +16,42 @@ import (
 	otelcontrib "go.opentelemetry.io/contrib"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
+
+// bodyStreamSize reports stream's exact remaining length, without reading it.
+func bodyStreamSize(stream io.Reader) (int64, bool) {
+	switch reader := stream.(type) {
+	case *io.LimitedReader:
+		if reader.N >= 0 {
+			return reader.N, true
+		}
+	case *bytes.Reader:
+		return int64(reader.Len()), true
+	case *bytes.Buffer:
+		return int64(reader.Len()), true
+	case *strings.Reader:
+		return int64(reader.Len()), true
+	}
+
+	return 0, false
+}
+
+// responseBodySuppressed reports whether fasthttp will send headers only, so
+// Content-Length must not be counted as bytes sent. Mirrors its mustSkipBody.
+func responseBodySuppressed(c fiber.Ctx) bool {
+	if c.Method() == fiber.MethodHead || c.Response().SkipBody {
+		return true
+	}
+
+	// 1xx, 204 and 304 responses must not include a message body.
+	status := c.Response().StatusCode()
+
+	return (status >= 100 && status < 200) || status == fiber.StatusNoContent || status == fiber.StatusNotModified
+}
 
 const (
 	tracerKey           = "gofiber-contrib-tracer-fiber"
@@ -35,6 +66,7 @@ const (
 	UnitDimensionless = "1"
 	UnitBytes         = "By"
 	UnitSeconds       = "s"
+	UnitRequest       = "{request}"
 
 	// Deprecated: use MetricNameHTTPServerRequestDuration.
 	MetricNameHttpServerDuration = MetricNameHTTPServerRequestDuration
@@ -49,50 +81,10 @@ const (
 	UnitMilliseconds = "ms"
 )
 
-type bodyStreamSizeReader struct {
-	reader io.Reader
-	onEOF  func(read int64)
-	read   int64
-	eof    sync.Once
-}
-
-func (b *bodyStreamSizeReader) Read(p []byte) (n int, err error) {
-	n, err = b.reader.Read(p)
-	if n > 0 {
-		atomic.AddInt64(&b.read, int64(n))
-	}
-	if err == io.EOF && b.onEOF != nil {
-		read := atomic.LoadInt64(&b.read)
-		b.eof.Do(func() {
-			b.onEOF(read)
-		})
-	}
-
-	return n, err
-}
-
-func (b *bodyStreamSizeReader) Close() error {
-	closer, ok := b.reader.(io.Closer)
-	if !ok {
-		return nil
-	}
-
-	return closer.Close()
-}
-
-func detachedMetricContext(ctx context.Context) context.Context {
-	detached := context.Background()
-
-	if spanContext := oteltrace.SpanContextFromContext(ctx); spanContext.IsValid() {
-		detached = oteltrace.ContextWithSpanContext(detached, spanContext)
-	}
-
-	if bg := baggage.FromContext(ctx); bg.Len() > 0 {
-		detached = baggage.ContextWithBaggage(detached, bg)
-	}
-
-	return detached
-}
+// httpServerRequestDurationBoundaries is the ExplicitBucketBoundaries advisory
+// parameter recommended by the semantic conventions for the
+// http.server.request.duration metric, expressed in seconds.
+var httpServerRequestDurationBoundaries = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
 
 // Middleware returns fiber handler which will trace incoming requests.
 func Middleware(opts ...Option) fiber.Handler {
@@ -126,7 +118,12 @@ func Middleware(opts ...Option) fiber.Handler {
 		)
 
 		var err error
-		httpServerDuration, err = meter.Float64Histogram(MetricNameHTTPServerRequestDuration, metric.WithUnit(UnitSeconds), metric.WithDescription("Duration of HTTP server requests."))
+		httpServerDuration, err = meter.Float64Histogram(
+			MetricNameHTTPServerRequestDuration,
+			metric.WithUnit(UnitSeconds),
+			metric.WithDescription("Duration of HTTP server requests."),
+			metric.WithExplicitBucketBoundaries(httpServerRequestDurationBoundaries...),
+		)
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -138,7 +135,7 @@ func Middleware(opts ...Option) fiber.Handler {
 		if err != nil {
 			otel.Handle(err)
 		}
-		httpServerActiveRequests, err = meter.Int64UpDownCounter(MetricNameHTTPServerActiveRequests, metric.WithUnit(UnitDimensionless), metric.WithDescription("Number of active HTTP server requests."))
+		httpServerActiveRequests, err = meter.Int64UpDownCounter(MetricNameHTTPServerActiveRequests, metric.WithUnit(UnitRequest), metric.WithDescription("Number of active HTTP server requests."))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -171,17 +168,27 @@ func Middleware(opts ...Option) fiber.Handler {
 		copy(responseMetricAttrs, requestMetricsAttrs)
 
 		request := c.Request()
-		isRequestBodyStream := request.IsBodyStream()
+		// Unmeasurable bodies are omitted rather than recorded as 0.
 		requestSize := int64(0)
-		var requestBodyStreamSizeReader *bodyStreamSizeReader
-		if isRequestBodyStream && !cfg.withoutMetrics {
-			requestBodyStream := request.BodyStream()
-			if requestBodyStream != nil {
-				requestBodyStreamSizeReader = &bodyStreamSizeReader{reader: requestBodyStream}
-				request.SetBodyStream(requestBodyStreamSizeReader, -1)
+		requestSizeKnown := false
+		switch {
+		case !c.HasBody():
+			requestSizeKnown = true
+		case request.IsBodyStream():
+			if streamSize, ok := bodyStreamSize(request.BodyStream()); ok {
+				requestSize = streamSize
+				requestSizeKnown = true
 			}
-		} else {
-			requestSize = int64(len(request.Body()))
+			// Content-Length is unusable here: fasthttp pre-reads only part of a
+			// streamed body, so an over-declared length would inflate the histogram.
+		default:
+			// use Content-Length to avoid re-marshaling the multipart body, including files, into memory.
+			if contentLength := request.Header.ContentLength(); contentLength > 0 {
+				requestSize = int64(contentLength)
+			} else {
+				requestSize = int64(len(request.Body()))
+			}
+			requestSizeKnown = true
 		}
 
 		reqHeader := make(http.Header)
@@ -222,42 +229,47 @@ func Middleware(opts ...Option) fiber.Handler {
 			semconv.HTTPRouteKey.String(c.Route().Path), // no need to copy c.Route().Path: route strings should be immutable across app lifecycle
 		}
 
-		response := c.Response()
-		isSSE := c.GetRespHeader("Content-Type") == "text/event-stream"
-		responseSize := int64(0)
-		isResponseBodyStream := response.IsBodyStream()
-		if !isResponseBodyStream && !isSSE {
-			responseSize = int64(len(response.Body()))
+		if c.Response().StatusCode() >= 500 {
+			responseAttrs = append(responseAttrs, semconv.ErrorTypeKey.String(strconv.Itoa(c.Response().StatusCode())))
 		}
 
-		if isResponseBodyStream && !isSSE && !cfg.withoutMetrics {
-			responseBodyStream := response.BodyStream()
-			if responseBodyStream != nil {
-				responseMetricAttrsWithResponse := append(responseMetricAttrs, responseAttrs...)
-				responseMetricsCtx := detachedMetricContext(savedCtx)
-				responseBodyStreamReader := &bodyStreamSizeReader{
-					reader: responseBodyStream,
-					onEOF: func(read int64) {
-						httpServerResponseSize.Record(responseMetricsCtx, read, metric.WithAttributes(responseMetricAttrsWithResponse...))
-					},
-				}
-				response.SetBodyStream(responseBodyStreamReader, -1)
-			} else {
-				isResponseBodyStream = false
+		response := c.Response()
+		contentType, _, _ := strings.Cut(c.GetRespHeader("Content-Type"), ";")
+		isSSE := utils.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
+		responseSize := int64(0)
+		responseSizeKnown := false
+		isResponseBodyStream := response.IsBodyStream()
+		if responseBodySuppressed(c) {
+			responseSize = 0
+			responseSizeKnown = true
+		} else if isSSE {
+			// skip size calculation for SSE streams
+		} else if isResponseBodyStream {
+			if contentLength := response.Header.ContentLength(); contentLength >= 0 {
+				responseSize = int64(contentLength)
+				responseSizeKnown = true
+			} else if streamSize, ok := bodyStreamSize(response.BodyStream()); ok {
+				responseSize = streamSize
+				responseSizeKnown = true
 			}
+			// A chunked size is only known after fasthttp streams the body. Measuring
+			// would mean replacing the stream, and SetBodyStream closes and truncates
+			// the original reader it replaces (#1734).
+		} else {
+			responseSize = int64(len(response.Body()))
+			responseSizeKnown = true
 		}
 
 		defer func() {
 			responseMetricAttrs = append(responseMetricAttrs, responseAttrs...)
-			if requestBodyStreamSizeReader != nil {
-				requestSize = atomic.LoadInt64(&requestBodyStreamSizeReader.read)
-			}
 
 			if !cfg.withoutMetrics {
 				httpServerActiveRequests.Add(savedCtx, -1, metric.WithAttributes(requestMetricsAttrs...))
 				httpServerDuration.Record(savedCtx, time.Since(start).Seconds(), metric.WithAttributes(responseMetricAttrs...))
-				httpServerRequestSize.Record(savedCtx, requestSize, metric.WithAttributes(responseMetricAttrs...))
-				if !isResponseBodyStream {
+				if requestSizeKnown {
+					httpServerRequestSize.Record(savedCtx, requestSize, metric.WithAttributes(responseMetricAttrs...))
+				}
+				if responseSizeKnown {
 					httpServerResponseSize.Record(savedCtx, responseSize, metric.WithAttributes(responseMetricAttrs...))
 				}
 			}
@@ -266,7 +278,7 @@ func Middleware(opts ...Option) fiber.Handler {
 			cancel()
 		}()
 
-		if !isResponseBodyStream {
+		if responseSizeKnown {
 			span.SetAttributes(append(responseAttrs, semconv.HTTPResponseBodySizeKey.Int64(responseSize))...)
 		} else {
 			span.SetAttributes(responseAttrs...)
@@ -276,7 +288,14 @@ func Middleware(opts ...Option) fiber.Handler {
 		spanStatus, spanMessage := internal.SpanStatusFromHTTPStatusCodeAndSpanKind(c.Response().StatusCode(), oteltrace.SpanKindServer)
 		span.SetStatus(spanStatus, spanMessage)
 
-		//Propagate tracing context as headers in outbound response
+		if cfg.TraceResponseHeader != "" {
+			traceID := span.SpanContext().TraceID()
+			if traceID.IsValid() {
+				c.Set(cfg.TraceResponseHeader, traceID.String())
+			}
+		}
+
+		// Propagate tracing context as headers in outbound response
 		tracingHeaders := make(propagation.HeaderCarrier)
 		cfg.Propagators.Inject(c.Context(), tracingHeaders)
 		for _, headerKey := range tracingHeaders.Keys() {
@@ -290,5 +309,9 @@ func Middleware(opts ...Option) fiber.Handler {
 // defaultSpanNameFormatter is the default formatter for spans created with the fiber
 // integration. Returns the route pathRaw
 func defaultSpanNameFormatter(ctx fiber.Ctx) string {
-	return ctx.Route().Path
+	route := ctx.Route().Path
+	if route == "" {
+		return utils.CopyString(ctx.Method())
+	}
+	return utils.CopyString(ctx.Method()) + " " + route
 }
